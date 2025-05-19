@@ -30,14 +30,16 @@ def parse_args():
     parser.add_argument('--rave_model', type=str, default='/path/to/rave_model', help='Path to the exported (.ts) RAVE model.')
     parser.add_argument('--audio_folder', type=str, default='/path/to/audio_folder', help='Path to the folder containing audio files.')
     parser.add_argument('--sample_rate', type=int, default=48000, choices=[44100, 48000], help='Sample rate for the audio files.')
-    parser.add_argument('--latent_length', type=int, default=4096, choices=[2048, 4096, 8192, 16384], help='Length of saved RAVE latents.')
+    parser.add_argument('--latent_length', type=int, default=4096, choices=[512, 1024, 2048, 4096, 8192, 16384], help='Length of saved RAVE latents.')
     parser.add_argument('--latent_folder', type=str, default='latents', help='Path to the folder where RAVE latent files will be saved.')
     parser.add_argument('--extensions', type=str, nargs="+",
                         default=['wav', 'opus', 'mp3', 'aac', 'flac'],
                         help='Extensions to search for in audio_folder')
+    parser.add_argument('--include_zcr', action='store_true', help='Include zero crossing rate in latent files.')
+    parser.add_argument('--include_rms', action='store_true', help='Include root mean square in latent files.')
     return parser.parse_args()
 
-def encode_and_save_latent(rave, audio_data, audio_file, latent_folder, latent_length):
+def encode_and_save_latent(rave, audio_data, audio_file, latent_folder, latent_length, include_zcr=False, include_rms=False):
     with torch.no_grad():
 
         x = torch.from_numpy(audio_data).reshape(1, 1, -1)
@@ -62,9 +64,30 @@ def encode_and_save_latent(rave, audio_data, audio_file, latent_folder, latent_l
 
         z = z.detach().numpy()
 
-        print("Saving latent of shape", z.shape)
+        if include_zcr:
+            zcr = np.mean(li.feature.zero_crossing_rate(x.squeeze().cpu().numpy()))
 
-        np.save(os.path.join(latent_folder, audio_file[:-4] + '.npy'), z)
+            print("Saving latent of shape", z.shape, "with zero crossing rate", zcr)
+
+            np.savez_compressed(
+                os.path.join(latent_folder, audio_file[:-4]),
+                z_audio=z,
+                zcr=zcr
+            )
+        elif include_rms:
+            rms = np.mean(li.feature.rms(y=x.squeeze().cpu().numpy()))
+
+            print("Saving latent of shape", z.shape, "with root mean square", rms)
+
+            np.savez_compressed(
+                os.path.join(latent_folder, audio_file[:-4]),
+                z_audio=z,
+                rms=rms
+            )
+        else:
+            print("Saving latent of shape", z.shape)
+
+            np.save(os.path.join(latent_folder, audio_file[:-4] + '.npy'), z)
 
 # from RAVE
 def load_audio_chunk(path: str, n_signal: int,
@@ -115,7 +138,7 @@ def main():
             cropped_data = np.frombuffer(chunk_bytes, dtype=np.int16).astype(np.float32) / 2**15
             output_file = f"{dir_hash}_{base_name}_part{i:03d}.wav"
             pbar.set_postfix_str(f"chunk:{i}")
-            encode_and_save_latent(rave, cropped_data, output_file, args.latent_folder, args.latent_length)
+            encode_and_save_latent(rave, cropped_data, output_file, args.latent_folder, args.latent_length, args.include_zcr, args.include_rms)
 
     print('Done encoding RAVE latents')
     print('Path to latents:', args.latent_folder)

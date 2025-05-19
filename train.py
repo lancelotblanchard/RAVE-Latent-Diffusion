@@ -13,6 +13,11 @@ import datetime
 import numpy as np
 import random
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+import wandb
+from librosa.feature import zero_crossing_rate, rms
+import numpy as np
+
 
 from audio_diffusion_pytorch import DiffusionModel, UNetV0, VDiffusion, VSampler
 
@@ -24,19 +29,57 @@ else:
     device = torch.device("cpu")
 current_date = datetime.date.today()
 
+# We need to project our embedding (ZCR or RMS) to a higher dimension
+class EmbeddingProjection(torch.nn.Module):
+    def __init__(self, diffusion_model, embedding_projection_size):
+        super().__init__()
+        self.diffusion_model = diffusion_model
+        self.projection0 = torch.nn.Linear(1, embedding_projection_size)
+        self.projection1 = torch.nn.Linear(embedding_projection_size, embedding_projection_size)
+
+    def forward(self, *args, embedding=None, **kwargs):
+        if embedding is not None:
+            embedding = F.silu(self.projection1(F.silu(self.projection0(embedding))))
+        return self.diffusion_model(*args, embedding=embedding, **kwargs)
+
+    @torch.no_grad()
+    def sample(self, *args, embedding=None, **kwargs):
+        if embedding is not None:
+            embedding = F.silu(self.projection1(F.silu(self.projection0(embedding))))
+        return self.diffusion_model.sample(*args, embedding=embedding, **kwargs)
+
 class RaveDataset(Dataset):
     def __init__(self, latent_folder, latent_files):
         self.latent_folder = latent_folder
         self.latent_files = latent_files
         self.latent_data = []
+        self.has_embedding = False
+        self.embedding = None
+
+        latent_size = -1
 
         for latent_file in self.latent_files:
             latent_path = os.path.join(self.latent_folder, latent_file)
             z = np.load(latent_path)
-            z = torch.from_numpy(z).float().squeeze()
-            self.latent_data.append(z)
+            if latent_path.endswith(".npz"):
+                self.has_embedding = True
+                z_audio = torch.from_numpy(z["z_audio"]).float().squeeze()
+                if "zcr" in z:
+                    self.embedding = "zcr"
+                    embedding = torch.from_numpy(z["zcr"]).float().reshape(-1, 1)
+                else:
+                    self.embedding = "rms"
+                    embedding = torch.from_numpy(z["rms"]).float().reshape(-1, 1)
+                self.latent_data.append({ "z_audio": z_audio, self.embedding: embedding })
+                if latent_size == -1:
+                    latent_size = z_audio.shape[0]
+            else:
+                z = torch.from_numpy(z).float().squeeze()
+                self.latent_data.append(z)
+                if latent_size == -1:
+                    latent_size = z.shape[0]
 
-        self.latent_size = self.latent_data[0].shape[0]
+        self.latent_size = latent_size
 
     def __len__(self):
         return len(self.latent_data)
@@ -57,6 +100,13 @@ def parse_args():
     parser.add_argument("--accumulation_steps", type=int, default=2, help="Number of gradient accumulation steps.")
     parser.add_argument("--save_interval", type=int, default=50, help="Interval (number of epochs) at which to save the model.")
     parser.add_argument("--finetune", type=bool, default=False, help="Finetune model.")
+    parser.add_argument("--wandb_project_name", type=str, default="rave-ld", help="The project name to use for WandB logging.")
+    parser.add_argument("--embedding_projection_size", type=int, default=128, help="Size of the output of the projection for the conditional embedding.")
+    parser.add_argument("--eval_mse_condition_every", type=int, default=0, help="The number of epochs between logging the MSE of the conditioning (ZCR or RMS) during evaluation. If set to 0, does not log.")
+    parser.add_argument("--rave_model_path", type=str, help="Path to the RAVE model checkpoint (required when --eval_mse_condition_every is > 0).")
+    parser.add_argument("--embedding_mask_proba", type=float, default=0.1, help="Probability of masking the embedding (when using a condition).")
+    parser.add_argument("--embedding_scale", type=float, default=5.0, help="Embedding (Guidance) scale for sampling (used when --eval_mse_condition_every is > 0).")
+    parser.add_argument("--num_steps", type=int, default=50, help="Number of steps for sampling (used when --eval_mse_condition_every is > 0).")
     return parser.parse_args()
 
 def set_seed(seed=664):
@@ -85,12 +135,19 @@ def resume_from_checkpoint(checkpoint_path, model, optimizer, scheduler):
 def main():
     # Parse command-line arguments
     args = parse_args()
+    
+    if args.eval_mse_condition_every > 0 and args.rave_model_path is None:
+        raise ValueError("When --eval_mse_condition_every is > 0, --rave_model_path must be provided.")
+
     latent_folder = args.latent_folder
     checkpoint_path = args.checkpoint_path
     save_out_path = args.save_out_path
     split_ratio = args.split_ratio
     batch_size = args.batch_size
     save_interval = args.save_interval
+    embedding_mask_proba = args.embedding_mask_proba
+    embedding_scale = args.embedding_scale
+    num_steps = args.num_steps
 
     global best_loss
     global best_epoch
@@ -99,7 +156,7 @@ def main():
 
     os.makedirs(args.save_out_path, exist_ok=True)
 
-    latent_files = [f for f in os.listdir(latent_folder) if f.endswith(".npy")]
+    latent_files = [f for f in os.listdir(latent_folder) if f.endswith(".npy") or f.endswith(".npz")]
 
     set_seed(664)
 
@@ -111,24 +168,35 @@ def main():
     train_dataset = RaveDataset(latent_folder, train_latent_files)
     val_dataset = RaveDataset(latent_folder, val_latent_files)
 
-    rave_dims = train_dataset.latent_size
+    # rave_dims = train_dataset.latent_size
+    rave_dims = 4 # unsure why ^ didn't work
 
     batch_size = args.batch_size
 
     train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
     val_data_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
 
-    model = DiffusionModel(
+    diffusion_model = DiffusionModel(
         net_t=UNetV0,
         in_channels=rave_dims,
         channels=[256, 256, 256, 256, 512, 512, 512, 768, 768],
-        factors=[1, 4, 4, 4, 2, 2, 2, 2, 2],
+        factors=[1, 4, 4, 4, 2, 2, 2, 1, 1],
         items=[1, 2, 2, 2, 2, 2, 2, 4, 4],
         attentions=[0, 0, 0, 0, 0, 1, 1, 1, 1],
         attention_heads=12,
         attention_features=64,
         diffusion_t=VDiffusion,
+        modulation_features=1024 if not train_dataset.has_embedding else args.embedding_projection_size,
+        use_embedding_cfg=train_dataset.has_embedding,
+        embedding_max_length=1 if train_dataset.has_embedding else None,
+        embedding_features=args.embedding_projection_size if train_dataset.has_embedding else None,
+        cross_attentions=[0, 0, 0, 1, 1, 1, 1, 1, 1] if train_dataset.has_embedding else None,
         sampler_t=VSampler,
+    )
+    
+    model = EmbeddingProjection(
+        diffusion_model=diffusion_model,
+        embedding_projection_size=args.embedding_projection_size,
     ).to(device)
 
     print("Model Architecture:")
@@ -138,6 +206,21 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total number of parameters: {total_params}")
     print(f"Number of trainable parameters: {trainable_params}\n")
+
+    rave_model = None
+    if args.rave_model_path is not None:
+        rave_model = torch.jit.load(
+            args.rave_model_path,
+            map_location=device,
+        )
+        print(f"Loaded RAVE model from {args.rave_model_path}")
+
+    embedding_func = None
+    if args.eval_mse_condition_every > 0:
+        if train_dataset.embedding == "zcr":
+            embedding_func = lambda x: np.mean(zero_crossing_rate(x), axis=-1)
+        elif train_dataset.embedding == "rms":
+            embedding_func = lambda x: np.mean(rms(y=x), axis=-1)
 
     print("Training:", len(train_latent_files))
     print("Validation:", len(val_latent_files))
@@ -158,15 +241,20 @@ def main():
 
     accumulation_steps = args.accumulation_steps
 
+    wandb.init(project=args.wandb_project_name, name=args.name)
+
     for i in range(start_epoch, args.max_epochs):
         model.train()
         train_loss = 0
         optimizer.zero_grad()
 
         for step, batch in enumerate(train_data_loader):
-            batch_rave_tensor = batch.to(device)
+            batch_rave_tensor = batch
 
-            loss = model(batch_rave_tensor)
+            if isinstance(batch_rave_tensor, dict):
+                loss = model(batch_rave_tensor["z_audio"].to(device), embedding=batch_rave_tensor[train_dataset.embedding].squeeze(-1).to(device), embedding_mask_proba=embedding_mask_proba)
+            else:
+                loss = model(batch_rave_tensor.to(device))
 
             train_loss += loss.item()
 
@@ -178,6 +266,7 @@ def main():
 
         train_loss /= len(train_data_loader)
         print(f"Epoch {i+1}, train loss: {train_loss}")
+        wandb.log({'epoch': i+1, 'train_loss': train_loss})
 
         random.shuffle(train_dataset.latent_files)
 
@@ -185,15 +274,35 @@ def main():
             model.eval()
 
             val_loss = 0
+            mse_loss = 0
             for batch in val_data_loader:
-                batch_rave_tensor = batch.to(device)
+                batch_rave_tensor = batch
 
-                loss = model(batch_rave_tensor)
+                if isinstance(batch_rave_tensor, dict):
+                    loss = model(batch_rave_tensor["z_audio"].to(device), embedding=batch_rave_tensor[train_dataset.embedding].squeeze(-1).to(device), embedding_mask_proba=embedding_mask_proba)
+                else:
+                    loss = model(batch_rave_tensor.to(device))
 
                 val_loss += loss.item()
 
+                if args.eval_mse_condition_every > 0 and i % args.eval_mse_condition_every == 0 and isinstance(batch_rave_tensor, dict):
+                    outputs = model.sample(batch_rave_tensor["z_audio"].to(device), embedding=batch_rave_tensor[train_dataset.embedding].squeeze(-1).to(device), num_steps=num_steps, embedding_scale=embedding_scale)
+                    outputs = (outputs - outputs.mean()) / outputs.std() # normalize to mean 0, std 1
+
+                    y = rave_model.decode(outputs)
+                    zcrs = embedding_func(y.cpu().numpy())
+                    mse_loss += torch.nn.functional.mse_loss(torch.tensor(zcrs), batch_rave_tensor[train_dataset.embedding]).item()
+
             val_loss /= len(val_data_loader)
             print(f"Epoch {i+1}, validation loss: {val_loss}")
+            wandb_log = {'epoch': i+1, 'val_loss': val_loss}
+
+            if args.eval_mse_condition_every > 0 and i % args.eval_mse_condition_every == 0:
+                mse_loss /= len(val_data_loader)
+                print(f"Epoch {i+1}, validation MSE loss: {mse_loss}")
+                wandb_log['mse_loss'] = mse_loss
+
+            wandb.log(wandb_log)
 
             # Save the best model
             if val_loss < best_loss:
@@ -226,6 +335,8 @@ def main():
                 torch.save(checkpoint, f"{save_out_path}/{args.name}_epoch{i}.pt")
 
             scheduler.step()
+
+    wandb.finish()
 
 if __name__ == '__main__':
     mp.set_start_method('spawn')
