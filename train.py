@@ -19,7 +19,10 @@ from librosa.feature import zero_crossing_rate, rms
 import numpy as np
 
 
-from audio_diffusion_pytorch import DiffusionModel, UNetV0, VDiffusion, VSampler
+# from audio_diffusion_pytorch import DiffusionModel, UNetV0, VDiffusion, VSampler
+
+from unet_mason import UNet1d
+from edm_mason import EDM
 
 if torch.cuda.is_available():
     device = torch.device("cuda:0")
@@ -29,63 +32,104 @@ else:
     device = torch.device("cpu")
 current_date = datetime.date.today()
 
-# We need to project our embedding (ZCR or RMS) to a higher dimension
-class EmbeddingProjection(torch.nn.Module):
-    def __init__(self, diffusion_model, embedding_projection_size):
-        super().__init__()
-        self.diffusion_model = diffusion_model
-        self.projection0 = torch.nn.Linear(1, embedding_projection_size)
-        self.projection1 = torch.nn.Linear(embedding_projection_size, embedding_projection_size)
-
-    def forward(self, *args, embedding=None, **kwargs):
-        if embedding is not None:
-            embedding = F.silu(self.projection1(F.silu(self.projection0(embedding))))
-        return self.diffusion_model(*args, embedding=embedding, **kwargs)
-
-    @torch.no_grad()
-    def sample(self, *args, embedding=None, **kwargs):
-        if embedding is not None:
-            embedding = F.silu(self.projection1(F.silu(self.projection0(embedding))))
-        return self.diffusion_model.sample(*args, embedding=embedding, **kwargs)
-
 class RaveDataset(Dataset):
-    def __init__(self, latent_folder, latent_files):
+    def __init__(self, latent_folder, latent_files, normalize=True):
         self.latent_folder = latent_folder
         self.latent_files = latent_files
         self.latent_data = []
         self.has_embedding = False
         self.embedding = None
+        self.normalize = normalize
+        self.normalization_params = {}
 
         latent_size = -1
-
+        
+        # First, collect all z_audio for normalization if needed
+        if normalize:
+            all_z_audio = []
+            # First pass only for computing min/max of z_audio
+            for latent_file in self.latent_files:
+                latent_path = os.path.join(self.latent_folder, latent_file)
+                z = np.load(latent_path)
+                
+                if latent_path.endswith(".npz"):
+                    z_audio = torch.from_numpy(z["z_audio"]).float().squeeze()
+                    all_z_audio.append(z_audio)
+                else:
+                    z = torch.from_numpy(z).float().squeeze()
+                    all_z_audio.append(z)
+            
+            # Calculate z_audio normalization parameters
+            if all_z_audio:
+                all_z_audio_cat = torch.cat(all_z_audio, dim=0)
+                z_min = all_z_audio_cat.min()
+                z_max = all_z_audio_cat.max()
+                self.normalization_params["z_audio"] = {"min": z_min, "max": z_max}
+        
+        # Now load the actual dataset with normalization applied only to z_audio
         for latent_file in self.latent_files:
             latent_path = os.path.join(self.latent_folder, latent_file)
             z = np.load(latent_path)
+            
             if latent_path.endswith(".npz"):
                 self.has_embedding = True
                 z_audio = torch.from_numpy(z["z_audio"]).float().squeeze()
+                
+                if normalize:
+                    z_audio = self._normalize_data(z_audio)
+                
                 if "zcr" in z:
                     self.embedding = "zcr"
                     embedding = torch.from_numpy(z["zcr"]).float().reshape(-1, 1)
+                    self.latent_data.append({"z_audio": z_audio, "zcr": embedding})
                 else:
                     self.embedding = "rms"
                     embedding = torch.from_numpy(z["rms"]).float().reshape(-1, 1)
-                self.latent_data.append({ "z_audio": z_audio, self.embedding: embedding })
+                    self.latent_data.append({"z_audio": z_audio, "rms": embedding})
+                
                 if latent_size == -1:
                     latent_size = z_audio.shape[0]
             else:
                 z = torch.from_numpy(z).float().squeeze()
+                if normalize:
+                    z = self._normalize_data(z)
                 self.latent_data.append(z)
                 if latent_size == -1:
                     latent_size = z.shape[0]
 
         self.latent_size = latent_size
 
+    def _normalize_data(self, data):
+        """Normalize data to range [-1, 1]"""
+        data_min = self.normalization_params["z_audio"]["min"]
+        data_max = self.normalization_params["z_audio"]["max"]
+        
+        # Handle edge case where min == max
+        if data_min == data_max:
+            return torch.zeros_like(data)
+        
+        # Scale to [-1, 1]
+        normalized = 2 * (data - data_min) / (data_max - data_min) - 1
+        return normalized
+    
+    def denormalize_data(self, data):
+        """Denormalize data from [-1, 1] back to original range"""
+        data_min = self.normalization_params["z_audio"]["min"]
+        data_max = self.normalization_params["z_audio"]["max"]
+        
+        # Scale back from [-1, 1] to original range
+        denormalized = 0.5 * (data + 1) * (data_max - data_min) + data_min
+        return denormalized
+
     def __len__(self):
         return len(self.latent_data)
 
     def __getitem__(self, index):
         return self.latent_data[index]
+    
+    def get_normalization_params(self):
+        """Returns the normalization parameters used"""
+        return self.normalization_params.copy() if self.normalize else None
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a model with a new dataset.")
@@ -104,6 +148,7 @@ def parse_args():
     parser.add_argument("--embedding_projection_size", type=int, default=128, help="Size of the output of the projection for the conditional embedding.")
     parser.add_argument("--eval_mse_condition_every", type=int, default=0, help="The number of epochs between logging the MSE of the conditioning (ZCR or RMS) during evaluation. If set to 0, does not log.")
     parser.add_argument("--rave_model_path", type=str, help="Path to the RAVE model checkpoint (required when --eval_mse_condition_every is > 0).")
+    parser.add_argument("--max_mse_examples", type=int, default=500, help="Maximum number of examples to use for MSE evaluation (used when --eval_mse_condition_every is > 0).")
     parser.add_argument("--embedding_mask_proba", type=float, default=0.1, help="Probability of masking the embedding (when using a condition).")
     parser.add_argument("--embedding_scale", type=float, default=5.0, help="Embedding (Guidance) scale for sampling (used when --eval_mse_condition_every is > 0).")
     parser.add_argument("--num_steps", type=int, default=50, help="Number of steps for sampling (used when --eval_mse_condition_every is > 0).")
@@ -176,27 +221,38 @@ def main():
     train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8, pin_memory=True)
     val_data_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8, pin_memory=True)
 
-    diffusion_model = DiffusionModel(
-        net_t=UNetV0,
-        in_channels=rave_dims,
-        channels=[256, 256, 256, 256, 512, 512, 512, 768, 768],
-        factors=[1, 4, 4, 4, 2, 2, 2, 1, 1],
-        items=[1, 2, 2, 2, 2, 2, 2, 4, 4],
-        attentions=[0, 0, 0, 0, 0, 1, 1, 1, 1],
-        attention_heads=12,
-        attention_features=64,
-        diffusion_t=VDiffusion,
-        modulation_features=1024 if not train_dataset.has_embedding else args.embedding_projection_size,
-        use_embedding_cfg=train_dataset.has_embedding,
-        embedding_max_length=1 if train_dataset.has_embedding else None,
-        embedding_features=args.embedding_projection_size if train_dataset.has_embedding else None,
-        cross_attentions=[0, 0, 0, 1, 1, 1, 1, 1, 1] if train_dataset.has_embedding else None,
-        sampler_t=VSampler,
-    )
+    # diffusion_model = DiffusionModel(
+    #     net_t=UNetV0,
+    #     in_channels=rave_dims,
+    #     channels=[256, 256, 256, 256, 512, 512, 512, 768, 768],
+    #     factors=[1, 4, 4, 4, 2, 2, 2, 1, 1],
+    #     items=[1, 2, 2, 2, 2, 2, 2, 4, 4],
+    #     attentions=[0, 0, 0, 0, 0, 1, 1, 1, 1],
+    #     attention_heads=12,
+    #     attention_features=64,
+    #     diffusion_t=VDiffusion,
+    #     modulation_features=1024 if not train_dataset.has_embedding else args.embedding_projection_size,
+    #     use_embedding_cfg=train_dataset.has_embedding,
+    #     embedding_max_length=1 if train_dataset.has_embedding else None,
+    #     embedding_features=args.embedding_projection_size if train_dataset.has_embedding else None,
+    #     cross_attentions=[0, 0, 0, 1, 1, 1, 1, 1, 1] if train_dataset.has_embedding else None,
+    #     sampler_t=VSampler,
+    # )
     
-    model = EmbeddingProjection(
-        diffusion_model=diffusion_model,
-        embedding_projection_size=args.embedding_projection_size,
+    # model = EmbeddingProjection(
+    #     diffusion_model=diffusion_model,
+    #     embedding_projection_size=args.embedding_projection_size,
+    # ).to(device)
+
+    model = EDM(
+        UNet1d(
+            in_channels=rave_dims,
+            out_channels=rave_dims,
+            use_t=True,
+            use_conditioning=True,
+        ),
+        datashape=(rave_dims, 512),
+        sigma_data=0.5,
     ).to(device)
 
     print("Model Architecture:")
@@ -252,7 +308,7 @@ def main():
             batch_rave_tensor = batch
 
             if isinstance(batch_rave_tensor, dict):
-                loss = model(batch_rave_tensor["z_audio"].to(device), embedding=batch_rave_tensor[train_dataset.embedding].squeeze(-1).to(device), embedding_mask_proba=embedding_mask_proba)
+                loss = model(batch_rave_tensor["z_audio"].to(device), condition=batch_rave_tensor[train_dataset.embedding].reshape(-1).to(device), cond_mask_prob=embedding_mask_proba)
             else:
                 loss = model(batch_rave_tensor.to(device))
 
@@ -275,30 +331,34 @@ def main():
 
             val_loss = 0
             mse_loss = 0
+            mse_num_examples = 0
             for batch in val_data_loader:
                 batch_rave_tensor = batch
 
                 if isinstance(batch_rave_tensor, dict):
-                    loss = model(batch_rave_tensor["z_audio"].to(device), embedding=batch_rave_tensor[train_dataset.embedding].squeeze(-1).to(device), embedding_mask_proba=embedding_mask_proba)
+                    loss = model(batch_rave_tensor["z_audio"].to(device), condition=batch_rave_tensor[train_dataset.embedding].reshape(-1).to(device), cond_mask_prob=embedding_mask_proba)
                 else:
                     loss = model(batch_rave_tensor.to(device))
 
                 val_loss += loss.item()
 
                 if args.eval_mse_condition_every > 0 and i % args.eval_mse_condition_every == 0 and isinstance(batch_rave_tensor, dict):
-                    outputs = model.sample(batch_rave_tensor["z_audio"].to(device), embedding=batch_rave_tensor[train_dataset.embedding].squeeze(-1).to(device), num_steps=num_steps, embedding_scale=embedding_scale)
+                    if mse_num_examples > args.max_mse_examples:
+                        continue
+                    outputs = model.generate(batch_size=batch_rave_tensor[train_dataset.embedding].shape[0], condition=batch_rave_tensor[train_dataset.embedding].reshape(-1).to(device), num_steps=num_steps, cond_scale=embedding_scale)
                     outputs = (outputs - outputs.mean()) / outputs.std() # normalize to mean 0, std 1
 
                     y = rave_model.decode(outputs)
                     zcrs = embedding_func(y.cpu().numpy())
                     mse_loss += torch.nn.functional.mse_loss(torch.tensor(zcrs), batch_rave_tensor[train_dataset.embedding]).item()
+                    mse_num_examples += len(batch_rave_tensor[train_dataset.embedding])
 
             val_loss /= len(val_data_loader)
             print(f"Epoch {i+1}, validation loss: {val_loss}")
             wandb_log = {'epoch': i+1, 'val_loss': val_loss}
 
             if args.eval_mse_condition_every > 0 and i % args.eval_mse_condition_every == 0:
-                mse_loss /= len(val_data_loader)
+                mse_loss /= mse_num_examples
                 print(f"Epoch {i+1}, validation MSE loss: {mse_loss}")
                 wandb_log['mse_loss'] = mse_loss
 
